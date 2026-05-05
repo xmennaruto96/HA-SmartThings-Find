@@ -55,24 +55,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     
     # Load all SmartThings-Find devices from the users account
     devices = await get_devices(hass, session, entry.entry_id)
-    
+
     # Create an update coordinator. This is responsible to regularly
     # fetch data from STF and update the device_tracker and sensor
     # entities
     update_interval = entry.options.get(CONF_UPDATE_INTERVAL, CONF_UPDATE_INTERVAL_DEFAULT)
     coordinator = SmartThingsFindCoordinator(hass, session, entry.entry_id, update_interval)
 
-    # This is what makes the whole integration slow to load (around 10-15
-    # seconds for my 15 devices) but it is the right way to do it. Only if
-    # it succeeds, the integration will be marked as successfully loaded.
-    await coordinator.async_config_entry_first_refresh()
-    
+    # Store everything the coordinator needs BEFORE the first refresh,
+    # because _async_update_data reads `devices` out of hass.data.
     hass.data[DOMAIN][entry.entry_id].update({
         CONF_JSESSIONID: jsessionid,
         "session": session,
         "coordinator": coordinator,
-        "devices": devices
+        "devices": devices,
     })
+
+    # This is what makes the whole integration slow to load (around 10-15
+    # seconds for my 15 devices) but it is the right way to do it. Only if
+    # it succeeds, the integration will be marked as successfully loaded.
+    await coordinator.async_config_entry_first_refresh()
 
     hass.async_create_task(
         hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

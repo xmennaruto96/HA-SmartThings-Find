@@ -43,8 +43,14 @@ class SmartThingsDeviceTracker(DeviceTrackerEntity):
 
         if 'icons' in device['data'] and 'coloredIcon' in device['data']['icons']:
             self._attr_entity_picture = device['data']['icons']['coloredIcon']
-        self.async_on_update(coordinator.async_add_listener(self.async_write_ha_state))
-    
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to coordinator updates once added to HA."""
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            self.coordinator.async_add_listener(self.async_write_ha_state)
+        )
+
     def async_write_ha_state(self):
         if not self.enabled:
             _LOGGER.debug(f"Ignoring state write request for disabled entity '{self.entity_id}'")

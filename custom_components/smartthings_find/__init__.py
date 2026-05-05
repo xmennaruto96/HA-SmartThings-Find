@@ -1,6 +1,7 @@
 from datetime import timedelta
 import logging
 import aiohttp
+from yarl import URL
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.const import Platform
@@ -39,7 +40,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     jsessionid = entry.data[CONF_JSESSIONID]
 
     session = async_get_clientsession(hass)
-    session.cookie_jar.update_cookies({"JSESSIONID": jsessionid})
+    # The shared HA session may already hold a JSESSIONID for this domain
+    # from a previous load (set via Set-Cookie). Clear it first; otherwise
+    # a bare update_cookies adds an unscoped duplicate and aiohttp ships the
+    # older, domain-matched (stale) value, breaking auth after a UI reauth.
+    session.cookie_jar.clear_domain("smartthingsfind.samsung.com")
+    session.cookie_jar.update_cookies(
+        {"JSESSIONID": jsessionid},
+        response_url=URL("https://smartthingsfind.samsung.com/"),
+    )
 
     active_smarttags = entry.options.get(CONF_ACTIVE_MODE_SMARTTAGS, CONF_ACTIVE_MODE_SMARTTAGS_DEFAULT)
     active_others = entry.options.get(CONF_ACTIVE_MODE_OTHERS, CONF_ACTIVE_MODE_OTHERS_DEFAULT)

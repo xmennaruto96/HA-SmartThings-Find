@@ -211,6 +211,28 @@ async def do_login_stage_two(session: aiohttp.ClientSession) -> str:
         return None
 
 
+async def validate_jsessionid(hass: HomeAssistant, jsessionid: str) -> bool:
+    """Check whether a JSESSIONID cookie is currently valid for SmartThings Find.
+
+    Performs a single GET against the CSRF endpoint with the cookie applied;
+    a valid session returns 200 with a `_csrf` response header.
+    """
+    session = async_get_clientsession(hass)
+    session.cookie_jar.update_cookies({"JSESSIONID": jsessionid})
+    try:
+        async with session.get(URL_GET_CSRF) as response:
+            if response.status == 200 and response.headers.get("_csrf"):
+                return True
+            body = (await response.text())[:200]
+            _LOGGER.warning(
+                f"JSESSIONID validation failed: status={response.status}, body='{body}'"
+            )
+            return False
+    except Exception as e:
+        _LOGGER.error(f"JSESSIONID validation error: {e}", exc_info=True)
+        return False
+
+
 async def fetch_csrf(hass: HomeAssistant, session: aiohttp.ClientSession, entry_id: str):
     """
     Retrieves the _csrf-Token which needs to be sent with each following request.
@@ -377,8 +399,13 @@ async def get_device_location(hass: HomeAssistant, session: aiohttp.ClientSessio
                                     utcDate = parse_stf_date(
                                         op['extra']['gpsUtcDt'])
                                 else:
-                                    _LOGGER.error(
-                                        f"[{dev_name}] No UTC date found for operation '{op['oprnType']}', this should not happen! OP: {json.dumps(op)}")
+                                    _LOGGER.warning(
+                                        f"[{dev_name}] No UTC date found for operation '{op['oprnType']}'. OP: {json.dumps(op)}")
+                                    continue
+
+                                if utcDate is None:
+                                    _LOGGER.warning(
+                                        f"[{dev_name}] Could not parse UTC date for operation '{op['oprnType']}'")
                                     continue
 
                                 if used_loc['gps_date'] and used_loc['gps_date'] >= utcDate:
@@ -419,6 +446,10 @@ async def get_device_location(hass: HomeAssistant, session: aiohttp.ClientSessio
                                     continue
                                 else:
                                     utcDate = parse_stf_date(loc['gpsUtcDt'])
+                                    if utcDate is None:
+                                        _LOGGER.warning(
+                                            f"[{dev_name}] Could not parse UTC date for encrypted location ('{op['oprnType']}')")
+                                        continue
                                     if used_loc['gps_date'] and used_loc['gps_date'] >= utcDate:
                                         _LOGGER.debug(
                                             f"[{dev_name}] Ignoring location older than the previous ({op['oprnType']})")
@@ -519,17 +550,18 @@ def get_sub_location(ops: list, subDeviceName: str) -> tuple:
     for op in ops:
         if subDeviceName in op.get('encLocation', {}):
             loc = op['encLocation'][subDeviceName]
+            gps_date = parse_stf_date(loc.get('gpsUtcDt', ''))
             sub_loc = {
-                "latitude": float(loc['latitude']),
-                "longitude": float(loc['longitude']),
+                "latitude": float(loc['latitude']) if loc.get('latitude') is not None else None,
+                "longitude": float(loc['longitude']) if loc.get('longitude') is not None else None,
                 "gps_accuracy": calc_gps_accuracy(loc.get('horizontalUncertainty'), loc.get('verticalUncertainty')),
-                "gps_date": parse_stf_date(loc['gpsUtcDt'])
+                "gps_date": gps_date
             }
             return op, sub_loc
     return {}, {}
 
 
-def parse_stf_date(datestr: str) -> datetime:
+def parse_stf_date(datestr: str) -> datetime | None:
     """
     Parses a date string in the format "%Y%m%d%H%M%S" to a datetime object.
     This is the format, the SmartThings Find API uses.
@@ -538,9 +570,16 @@ def parse_stf_date(datestr: str) -> datetime:
         datestr (str): The date string in the format "%Y%m%d%H%M%S".
 
     Returns:
-        datetime: A datetime object representing the input date string.
+        datetime: A datetime object representing the input date string,
+        or None if parsing fails.
     """
-    return datetime.strptime(datestr, "%Y%m%d%H%M%S").replace(tzinfo=pytz.UTC)
+    if not datestr:
+        return None
+    try:
+        return datetime.strptime(datestr, "%Y%m%d%H%M%S").replace(tzinfo=pytz.UTC)
+    except ValueError:
+        _LOGGER.warning(f"Failed to parse date string: '{datestr}'")
+        return None
 
 
 def get_battery_level(dev_name: str, ops: list) -> int:

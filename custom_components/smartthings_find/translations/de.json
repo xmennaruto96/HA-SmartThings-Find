@@ -3,9 +3,18 @@
     "abort": {
       "reauth_successful": "Erfolgreich authentifiziert."
     },
-    "progress": {
-      "task_stage_one": "Vorbereitung läuft, bitte warten...",
-      "task_stage_two": "Bitte scanne den QR Code mit deinem Galaxy-Gerät, um dich anzumelden. Alternativ kannst du dich direkt im Browser anmelden, indum du [hier]({url}) klickst. \n\n![QR Code](data:image/png;base64,{qr_code})\n\nCode kann nicht gescannt werden? Gehe auf [signin.samsung.com/key](https://signin.samsung.com/key/) und gib den folgenden Code ein:\n\n## ```{code}```\n"
+    "error": {
+      "invalid_auth": "Das Cookie wurde von SmartThings Find abgelehnt. Stelle sicher, dass du nur den Wert des JSESSIONID-Cookies (nicht den gesamten Cookie-Header) aus einer angemeldeten Sitzung kopiert hast.",
+      "empty_cookie": "Bitte einen JSESSIONID-Wert einfügen."
+    },
+    "step": {
+      "user": {
+        "title": "JSESSIONID-Cookie einfügen",
+        "description": "Samsungs QR-Code-Login funktioniert nicht mehr (account.samsung.com wurde umgebaut). Bis das ersetzt ist, musst du das Session-Cookie manuell besorgen:\n\n1. Öffne [smartthingsfind.samsung.com](https://smartthingsfind.samsung.com/) in einem normalen Browser und melde dich an.\n2. Öffne DevTools → Anwendung (Chrome) bzw. Speicher (Firefox) → Cookies → smartthingsfind.samsung.com.\n3. Kopiere den Wert des **JSESSIONID**-Cookies und füge ihn unten ein.\n\nDas Cookie bleibt meist mehrere Wochen gültig. Läuft es ab, fordert Home Assistant eine erneute Authentifizierung an – dann diese Schritte einfach wiederholen.",
+        "data": {
+          "jsessionid": "JSESSIONID"
+        }
+      }
     }
   },
   "options": {

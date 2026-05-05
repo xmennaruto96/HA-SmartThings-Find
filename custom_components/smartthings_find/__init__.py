@@ -60,7 +60,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # fetch data from STF and update the device_tracker and sensor
     # entities
     update_interval = entry.options.get(CONF_UPDATE_INTERVAL, CONF_UPDATE_INTERVAL_DEFAULT)
-    coordinator = SmartThingsFindCoordinator(hass, session, devices, update_interval)
+    coordinator = SmartThingsFindCoordinator(hass, session, entry.entry_id, update_interval)
 
     # This is what makes the whole integration slow to load (around 10-15
     # seconds for my 15 devices) but it is the right way to do it. Only if
@@ -92,10 +92,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 class SmartThingsFindCoordinator(DataUpdateCoordinator):
     """Class to manage fetching SmartThings Find data."""
 
-    def __init__(self, hass: HomeAssistant, session: aiohttp.ClientSession, devices, update_interval : int):
+    def __init__(self, hass: HomeAssistant, session: aiohttp.ClientSession, entry_id: str, update_interval : int):
         """Initialize the coordinator."""
         self.session = session
-        self.devices = devices
+        self._entry_id = entry_id
         self.hass = hass
         super().__init__(
             hass,
@@ -107,11 +107,12 @@ class SmartThingsFindCoordinator(DataUpdateCoordinator):
     async def _async_update_data(self):
         """Fetch data from SmartThings Find."""
         try:
+            devices = self.hass.data[DOMAIN][self._entry_id]["devices"]
             tags = {}
             _LOGGER.debug(f"Updating locations...")
-            for device in self.devices:
+            for device in devices:
                 dev_data = device['data']
-                tag_data = await get_device_location(self.hass, self.session, dev_data, self.config_entry.entry_id)
+                tag_data = await get_device_location(self.hass, self.session, dev_data, self._entry_id)
                 tags[dev_data['dvceID']] = tag_data
             _LOGGER.debug(f"Fetched {len(tags)} locations")
             return tags

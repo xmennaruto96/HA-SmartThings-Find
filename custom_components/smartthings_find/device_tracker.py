@@ -43,7 +43,7 @@ class SmartThingsDeviceTracker(DeviceTrackerEntity):
 
         if 'icons' in device['data'] and 'coloredIcon' in device['data']['icons']:
             self._attr_entity_picture = device['data']['icons']['coloredIcon']
-        self.async_update = coordinator.async_add_listener(self.async_write_ha_state)
+        self.async_on_update(coordinator.async_add_listener(self.async_write_ha_state))
     
     def async_write_ha_state(self):
         if not self.enabled:

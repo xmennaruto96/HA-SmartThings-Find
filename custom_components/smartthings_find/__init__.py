@@ -90,6 +90,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
     return True
 
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, entry: ConfigEntry, device
+) -> bool:
+    """Allow the user to remove a device from this config entry.
+
+    Returning True unconditionally lets HA delete the device + its entities
+    from the registry. If the same dvceID later reappears in Samsung's
+    response, the next setup will recreate fresh entries for it.
+    """
+    return True
+
+
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     unload_success = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)

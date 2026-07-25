@@ -6,7 +6,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.const import Platform
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.config_entries import ConfigEntry
 
@@ -33,18 +33,21 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up SmartThings Find from a config entry."""
-    
+
     hass.data[DOMAIN][entry.entry_id] = {}
 
     # Load the jsessionid from the config and create a session from it
     jsessionid = entry.data[CONF_JSESSIONID]
 
-    session = async_get_clientsession(hass)
-    # The shared HA session may already hold a JSESSIONID for this domain
-    # from a previous load (set via Set-Cookie). Clear it first; otherwise
-    # a bare update_cookies adds an unscoped duplicate and aiohttp ships the
-    # older, domain-matched (stale) value, breaking auth after a UI reauth.
-    session.cookie_jar.clear_domain("smartthingsfind.samsung.com")
+    # Each Samsung account (config entry) gets its OWN aiohttp session with
+    # its own private cookie jar -- never HA's shared instance-wide session
+    # (async_get_clientsession). aiohttp's cookie jar only holds a single
+    # JSESSIONID value per domain. If two accounts shared one jar, setting
+    # up the 2nd account would clear/overwrite the 1st account's cookie,
+    # and every subsequent request from *either* entry would then send
+    # whichever account's cookie happened to be there last -- breaking
+    # both sessions. A private session per entry makes that impossible.
+    session = async_create_clientsession(hass)
     session.cookie_jar.update_cookies(
         {"JSESSIONID": jsessionid},
         response_url=URL("https://smartthingsfind.samsung.com/"),
@@ -61,7 +64,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # This raises ConfigEntryAuthFailed-exception if failed. So if we
     # can continue after fetch_csrf, we know that authentication was ok
     await fetch_csrf(hass, session, entry.entry_id)
-    
+
     # Load all SmartThings-Find devices from the users account
     devices = await get_devices(hass, session, entry.entry_id)
 
@@ -106,7 +109,15 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     unload_success = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_success:
-        hass.data[DOMAIN].pop(entry.entry_id)
+        entry_data = hass.data[DOMAIN].pop(entry.entry_id, {})
+        # This entry owns a private aiohttp session created in
+        # async_setup_entry (async_create_clientsession). HA only closes
+        # such sessions automatically at final shutdown, so we must close
+        # it here ourselves -- otherwise every reload (reauth, options
+        # change, manual reload) leaks one open session/connector.
+        session = entry_data.get("session")
+        if session and not session.closed:
+            await session.close()
     else:
         _LOGGER.error(f"Unload failed: {unload_success}")
     return unload_success

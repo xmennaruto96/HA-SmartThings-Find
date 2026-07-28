@@ -1,9 +1,10 @@
+import asyncio
 import logging
 import json
 import pytz
 import aiohttp
 import html
-from datetime import datetime
+from datetime import datetime, timezone
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.exceptions import ConfigEntryAuthFailed
@@ -17,6 +18,25 @@ URL_GET_CSRF = "https://smartthingsfind.samsung.com/chkLogin.do"
 URL_DEVICE_LIST = "https://smartthingsfind.samsung.com/device/getDeviceList.do"
 URL_REQUEST_LOC_UPDATE = "https://smartthingsfind.samsung.com/dm/addOperation.do"
 URL_SET_LAST_DEVICE = "https://smartthingsfind.samsung.com/device/setLastSelect.do"
+
+# Active mode asks Samsung to wake the device and report a fresh fix, then waits
+# for that fix to appear. The sequence, mirroring what the web client does, is:
+#   1. setLastSelect.do  -- make this device the current server-side selection
+#   2. addOperation.do   -- CHECK_CONNECTION (battery/lock), then LOCATION (GPS)
+#   3. re-poll setLastSelect.do until a fix newer than ACTIVE_POLL_FRESH_MAX_AGE
+#      appears, or we time out and fall back to the last known location.
+# Note the two SEPARATE operations in step 2. A single combined
+# "CHECK_CONNECTION_WITH_LOCATION" is rejected by Samsung with resultCode 02,
+# meaning the device is never asked for anything and the integration silently
+# re-reads a stale fix forever. Accepted operations answer resultCode 00.
+ACTIVE_POLL_INTERVAL = 3        # seconds between re-checks
+# Samsung returns a fix in ~2-4 seconds, so a short wait gets same-cycle
+# freshness. Keep this modest: the FIRST refresh runs inside async_setup_entry,
+# and Home Assistant cancels the config entry when setup runs long
+# (devices x timeout). Set to 0 to never wait in-line -- the fix is then picked
+# up on the next coordinator cycle instead.
+ACTIVE_POLL_TIMEOUT = 25
+ACTIVE_POLL_FRESH_MAX_AGE = 120  # a fix newer than this (seconds) counts as "the one we just requested"
 
 
 async def validate_jsessionid(hass: HomeAssistant, jsessionid: str) -> bool:
@@ -98,7 +118,7 @@ async def get_devices(hass: HomeAssistant, session: aiohttp.ClientSession, entry
         if response.status != 200:
             _LOGGER.error(f"Failed to retrieve devices [{response.status}]: {await response.text()}")
             if response.status == 404:
-                _LOGGER.warn(
+                _LOGGER.warning(
                     f"Received 404 while trying to fetch devices -> Triggering reauth")
                 raise ConfigEntryAuthFailed(
                     "Request to get device list failed: 404")
@@ -131,17 +151,6 @@ async def get_devices(hass: HomeAssistant, session: aiohttp.ClientSession, entry
 
 
 async def get_device_location(hass: HomeAssistant, session: aiohttp.ClientSession, dev_data: dict, entry_id: str) -> dict:
-    """
-    Sends requests to update the device's location and retrieves the current location data for the specified device.
-
-    Args:
-        hass (HomeAssistant): Home Assistant instance.
-        session (aiohttp.ClientSession): The current session.
-        dev_data (dict): The device information obtained from get_devices.
-
-    Returns:
-        dict: The device location data.
-    """
     dev_id = dev_data['dvceID']
     dev_name = dev_data['modelName']
 
@@ -150,11 +159,21 @@ async def get_device_location(hass: HomeAssistant, session: aiohttp.ClientSessio
         "removeDevice": []
     }
 
-    update_payload = {
-        "dvceId": dev_id,
-        "operation": "CHECK_CONNECTION_WITH_LOCATION",
-        "usrId": dev_data['usrId']
-    }
+    # Samsung rejects "CHECK_CONNECTION_WITH_LOCATION" with resultCode 02. The
+    # web client sends TWO separate operations instead, each of which is
+    # accepted with resultCode 00:
+    #   CHECK_CONNECTION -> battery, lock status, model
+    #   LOCATION         -> the actual fresh GPS fix
+    # Order matters only in that CHECK_CONNECTION wakes/greets the device first,
+    # which is the order the browser uses.
+    update_payloads = [
+        {
+            "dvceId": dev_id,
+            "operation": operation,
+            "usrId": dev_data['usrId'],
+        }
+        for operation in ("CHECK_CONNECTION", "LOCATION")
+    ]
 
     csrf_token = hass.data[DOMAIN][entry_id]["_csrf"]
 
@@ -165,14 +184,100 @@ async def get_device_location(hass: HomeAssistant, session: aiohttp.ClientSessio
              [entry_id][CONF_ACTIVE_MODE_OTHERS])
         )
 
-        if active:
-            _LOGGER.debug("Active mode; requesting location update now")
-            async with session.post(f"{URL_REQUEST_LOC_UPDATE}?_csrf={csrf_token}", json=update_payload) as response:
-                # _LOGGER.debug(f"[{dev_name}] Update request response ({response.status}): {await response.text()}")
-                pass
-        else:
+        if not active:
             _LOGGER.debug("Passive mode; not requesting location update")
+            return await _fetch_last_select(session, set_last_payload, csrf_token, dev_id, dev_name)
 
+        _LOGGER.debug(f"[{dev_name}] Selecting target device")
+        pre = await _fetch_last_select(
+            session, set_last_payload, csrf_token, dev_id, dev_name)
+        if pre is None:
+            _LOGGER.warning(
+                f"[{dev_name}] setLastSelect failed before addOperation; aborting this cycle")
+            return None
+        # Brief settle so the selection has registered server-side before the
+        # operations are queued against it.
+        await asyncio.sleep(1)
+
+        # Each addOperation.do response is inspected. A healthy reply looks like
+        #   {"oprnType": "LOCATION", "reqId": "...", "resultCode": "00"}
+        # resultCode "00" = accepted, the device has been asked for a fix.
+        # resultCode "02" = rejected; that is what the old single
+        # CHECK_CONNECTION_WITH_LOCATION operation returned forever.
+        accepted = 0
+        for update_payload in update_payloads:
+            operation = update_payload["operation"]
+            async with session.post(
+                f"{URL_REQUEST_LOC_UPDATE}?_csrf={csrf_token}",
+                json=update_payload,
+                headers={'Accept': 'application/json'},
+            ) as response:
+                body = (await response.text())[:500]
+                _LOGGER.debug(
+                    f"[{dev_name}] addOperation {operation} -> "
+                    f"[{response.status}]: '{body}'")
+                if response.status == 401 or body.strip() == 'Logout':
+                    raise ConfigEntryAuthFailed(
+                        f"Session not valid anymore while requesting "
+                        f"{operation}: status {response.status}, body '{body}'")
+                if response.status != 200:
+                    _LOGGER.warning(
+                        f"[{dev_name}] {operation} request failed "
+                        f"[{response.status}]: '{body}'")
+                    continue
+                try:
+                    result_code = json.loads(body).get("resultCode")
+                except (ValueError, AttributeError):
+                    result_code = None
+                if result_code == "00":
+                    accepted += 1
+                else:
+                    _LOGGER.warning(
+                        f"[{dev_name}] {operation} was NOT accepted by Samsung "
+                        f"(resultCode {result_code}); no fresh fix will arrive "
+                        f"for this operation")
+
+        if not accepted:
+            _LOGGER.warning(
+                f"[{dev_name}] no operation was accepted; falling back to the "
+                f"last known location")
+
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + ACTIVE_POLL_TIMEOUT
+        res = None
+        while True:
+            res = await _fetch_last_select(session, set_last_payload, csrf_token, dev_id, dev_name)
+            if res is None:
+                return None
+            used_loc = res.get('used_loc')
+            gps_date = used_loc.get('gps_date') if used_loc else None
+            if gps_date and (datetime.now(timezone.utc) - gps_date).total_seconds() < ACTIVE_POLL_FRESH_MAX_AGE:
+                _LOGGER.debug(
+                    f"[{dev_name}] active mode: got a fresh fix from {gps_date.isoformat()}")
+                break
+            if loop.time() >= deadline:
+                _LOGGER.debug(
+                    f"[{dev_name}] active mode: no fix newer than {ACTIVE_POLL_FRESH_MAX_AGE}s "
+                    f"within {ACTIVE_POLL_TIMEOUT}s wait; using latest available "
+                    f"(newest seen: {gps_date.isoformat() if gps_date else 'none'})")
+                break
+            await asyncio.sleep(ACTIVE_POLL_INTERVAL)
+        return res
+
+    except ConfigEntryAuthFailed:
+        raise
+    except Exception as e:
+        _LOGGER.error(f"[{dev_name}] Exception occurred while fetching location data for tag '{dev_name}': {e}", exc_info=True)
+        return None
+
+
+async def _fetch_last_select(session: aiohttp.ClientSession, set_last_payload: dict, csrf_token: str, dev_id: str, dev_name: str) -> dict:
+    """Call setLastSelect.do once and parse whatever operation data comes back.
+
+    This is exactly the original single-shot logic from get_device_location,
+    pulled out so the active-mode poll loop above can call it repeatedly.
+    """
+    try:
         async with session.post(f"{URL_SET_LAST_DEVICE}?_csrf={csrf_token}", json=set_last_payload, headers={'Accept': 'application/json'}) as response:
             _LOGGER.debug(
                 f"[{dev_name}] Location response ({response.status})")
@@ -202,9 +307,9 @@ async def get_device_location(hass: HomeAssistant, session: aiohttp.ClientSessio
                     # contains multiple locations (especially for non-SmartTag devices such as phones).
                     # We go through all of them and find the "most usable" one. Sometimes locations
                     # are encrypted (usually OFFLINE_LOC), we ignore these. They could probably also
-                    # be encrypted; there is a special getEncToken-Endpoint which returns some sort of
+                    # be decrypted; there is a special getEncToken-Endpoint which returns some sort of
                     # key. Since the only encrypted locations I encountered were even older than the
-                    # non encrypted ones, I didn't try anything to encrypt them yet.
+                    # non encrypted ones, I didn't try anything to decrypt them yet.
                     for op in data['operation']:
                         if op['oprnType'] in ['LOCATION', 'LASTLOC', 'OFFLINE_LOC']:
                             if 'latitude' in op:
@@ -239,7 +344,7 @@ async def get_device_location(hass: HomeAssistant, session: aiohttp.ClientSessio
                                     locFound = True
 
                                 if not locFound:
-                                    _LOGGER.warn(
+                                    _LOGGER.warning(
                                         f"[{dev_name}] Found no coordinates in operation '{op['oprnType']}'")
                                 else:
                                     res['location_found'] = True
@@ -270,6 +375,13 @@ async def get_device_location(hass: HomeAssistant, session: aiohttp.ClientSessio
                                             f"[{dev_name}] Ignoring location older than the previous ({op['oprnType']})")
                                         continue
                                     else:
+                                        # Original code set location_found in
+                                        # the *else* of "if 'longitude' in loc",
+                                        # i.e. only when longitude was MISSING,
+                                        # which is backwards. Phones commonly
+                                        # report via this encLocation branch, so
+                                        # coordinates were parsed but the result
+                                        # was never flagged as a valid location.
                                         locFound = False
                                         if 'latitude' in loc:
                                             used_loc['latitude'] = float(
@@ -279,12 +391,12 @@ async def get_device_location(hass: HomeAssistant, session: aiohttp.ClientSessio
                                             used_loc['longitude'] = float(
                                                 loc['longitude'])
                                             locFound = True
-                                        else:
-                                            res['location_found'] = True
 
                                         if not locFound:
-                                            _LOGGER.warn(
+                                            _LOGGER.warning(
                                                 f"[{dev_name}] Found no coordinates in operation '{op['oprnType']}'")
+                                        else:
+                                            res['location_found'] = True
 
                                         used_loc['gps_accuracy'] = calc_gps_accuracy(
                                             loc.get('horizontalUncertainty'), loc.get('verticalUncertainty'))
@@ -296,14 +408,14 @@ async def get_device_location(hass: HomeAssistant, session: aiohttp.ClientSessio
                         res['used_op'] = used_op
                         res['used_loc'] = used_loc
                     else:
-                        _LOGGER.warn(
+                        _LOGGER.warning(
                             f"[{dev_name}] No useable location-operation found")
 
                     _LOGGER.debug(
                         f"    --> {dev_name} used operation: {'NONE' if not used_op else used_op['oprnType']}")
 
                 else:
-                    _LOGGER.warn(
+                    _LOGGER.warning(
                         f"[{dev_name}] No operation found in response; marking update failed")
                     res['update_success'] = False
                 return res
@@ -313,8 +425,8 @@ async def get_device_location(hass: HomeAssistant, session: aiohttp.ClientSessio
                 res_text = await response.text()
                 _LOGGER.debug(f"[{dev_name}] Full response: '{res_text}'")
 
-                # Our session is not valid anymore. Refreshing the CSRF Token ist not
-                # enough at this point. Instead we have to ask the user to  go through
+                # Our session is not valid anymore. Refreshing the CSRF Token is not
+                # enough at this point. Instead we have to ask the user to go through
                 # the whole auth flow again
                 if res_text == 'Logout' or response.status == 401:
                     raise ConfigEntryAuthFailed(
@@ -344,7 +456,7 @@ def calc_gps_accuracy(hu: float, vu: float) -> float:
     """
     try:
         return round((float(hu)**2 + float(vu)**2) ** 0.5, 1)
-    except ValueError:
+    except (ValueError, TypeError):
         return None
 
 
@@ -416,7 +528,7 @@ def get_battery_level(dev_name: str, ops: list) -> int:
                 try:
                     batt = int(batt_raw)
                 except ValueError:
-                    _LOGGER.warn(
+                    _LOGGER.warning(
                         f"[{dev_name}]: Received invalid battery level: {batt_raw}")
             return batt
     return None
